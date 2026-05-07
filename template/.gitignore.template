@@ -1,0 +1,4 @@
+# Append these lines to your project's .gitignore if you don't want
+# the in-progress task store committed. Keep PROGRESS-*.md committed
+# (they're your work log).
+progress/tasks.json.tmp
