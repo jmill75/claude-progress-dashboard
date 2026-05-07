@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Stop hook: ensure today's progress/PROGRESS-YYYY-MM-DD.md exists with a header,
-# and if source files changed, remind Claude to append an entry.
+# Stop hook: ensure today's progress/PROGRESS-YYYY-MM-DD.md exists, and
+# auto-append entries for any commits made today that aren't already logged.
 #
-# Source dirs to watch are read from .claude/progress-watch.txt (one glob per line),
-# falling back to a sensible default set.
+# Source dirs to watch are read from .claude/progress-watch.txt (one glob per
+# line), with a sensible default set if missing. Only commits touching those
+# paths are logged; pure-progress commits are skipped to avoid recursion.
 set -u
 
 # Resolve to the main repo root, even when invoked from inside a worktree.
@@ -17,14 +18,13 @@ cd "$REPO_ROOT" || exit 0
 TODAY="$(date +%Y-%m-%d)"
 PROGRESS_FILE="progress/PROGRESS-${TODAY}.md"
 
-# Always make sure today's file exists with a header — so the dashboard's
-# "Today" view always has something to render, even before the first entry.
+# Always make sure today's file exists with a header.
 if [ ! -f "$PROGRESS_FILE" ]; then
   mkdir -p progress
   printf '# Progress %s\n\n' "$TODAY" > "$PROGRESS_FILE"
 fi
 
-# Load source-dir globs to watch. Default to common code dirs across stacks.
+# Load source-dir globs to watch.
 WATCH_FILE=".claude/progress-watch.txt"
 WATCH_GLOBS=()
 if [ -f "$WATCH_FILE" ]; then
@@ -38,23 +38,78 @@ if [ "${#WATCH_GLOBS[@]}" -eq 0 ]; then
   WATCH_GLOBS=(
     'src/**/*'
     'app/**/*'
+    'App/**/*'
     'lib/**/*'
     'pages/**/*'
     'components/**/*'
+    'Core/**/*'
+    'Features/**/*'
+    'Navigation/**/*'
+    'WatchApp/**/*'
+    'Algorithms/**/*'
   )
 fi
 
+# Auto-log: walk today's commits, skip ones already in the progress file,
+# skip ones that only touch progress/ (avoid recursion), append the rest.
+SINCE="$TODAY 00:00"
+UNTIL="$TODAY 23:59"
+
+# Get full SHAs for commits in the window. --no-pager keeps it scriptable.
+COMMITS="$(git --no-pager log --since="$SINCE" --until="$UNTIL" --reverse --format='%H' 2>/dev/null)"
+
+APPENDED=0
+if [ -n "$COMMITS" ]; then
+  while IFS= read -r sha; do
+    [ -z "$sha" ] && continue
+    short="$(git rev-parse --short=7 "$sha")"
+
+    # Skip if this commit's SHA is already mentioned anywhere in today's file.
+    if grep -qF "($short)" "$PROGRESS_FILE"; then
+      continue
+    fi
+
+    # Does this commit touch any watched source path?
+    files="$(git --no-pager show --name-only --format= "$sha" 2>/dev/null)"
+    [ -z "$files" ] && continue
+
+    touched_source=0
+    while IFS= read -r f; do
+      [ -z "$f" ] && continue
+      # Skip pure progress-log changes
+      case "$f" in
+        progress/*) continue ;;
+      esac
+      for glob in "${WATCH_GLOBS[@]}"; do
+        # bash extglob/glob match. Use case for portable globbing.
+        case "$f" in
+          $glob) touched_source=1; break ;;
+        esac
+      done
+      [ "$touched_source" -eq 1 ] && break
+    done <<< "$files"
+
+    [ "$touched_source" -eq 0 ] && continue
+
+    # Build the entry line.
+    time_hm="$(git --no-pager show -s --format='%cd' --date=format:'%H:%M' "$sha")"
+    subject="$(git --no-pager show -s --format='%s' "$sha")"
+    printf -- '- %s — %s (%s)\n' "$time_hm" "$subject" "$short" >> "$PROGRESS_FILE"
+    APPENDED=$((APPENDED + 1))
+  done <<< "$COMMITS"
+fi
+
+# If there are uncommitted source-file changes and the file still has no
+# entries, nudge Claude to log a manual one — auto-log only catches commits.
 DIRTY="$(git status --porcelain -- "${WATCH_GLOBS[@]}" 2>/dev/null)"
-
-if [ -z "$DIRTY" ]; then
-  exit 0
-fi
-
-if grep -qE '^- [0-9]{2}:[0-9]{2} —' "$PROGRESS_FILE"; then
-  exit 0
-fi
-
-cat <<EOF
+if [ -n "$DIRTY" ] && ! grep -qE '^- [0-9]{2}:[0-9]{2} —' "$PROGRESS_FILE"; then
+  cat <<EOF
 Before stopping: source files changed but today's progress log (${PROGRESS_FILE}) has no entries. Append a one-line entry describing what changed, format: "- HH:MM — short description".
 EOF
-exit 2
+  exit 2
+fi
+
+if [ "$APPENDED" -gt 0 ]; then
+  echo "[progress hook] auto-logged $APPENDED commit(s) to $PROGRESS_FILE"
+fi
+exit 0
