@@ -50,13 +50,16 @@ if [ "${#WATCH_GLOBS[@]}" -eq 0 ]; then
   )
 fi
 
-# Auto-log: walk today's commits, skip ones already in the progress file,
-# skip ones that only touch progress/ (avoid recursion), append the rest.
+# Auto-log: walk today's commits across ALL refs (so work on Claude worktree
+# branches still gets logged), skip ones already in the progress file, skip
+# ones that only touch progress/ (avoid recursion), append the rest.
 SINCE="$TODAY 00:00"
 UNTIL="$TODAY 23:59"
 
-# Get full SHAs for commits in the window. --no-pager keeps it scriptable.
-COMMITS="$(git --no-pager log --since="$SINCE" --until="$UNTIL" --reverse --format='%H' 2>/dev/null)"
+# --all walks every ref, --reverse sorts ascending by date so we append in
+# chronological order. Dedup by SHA in case a commit is reachable from
+# multiple refs.
+COMMITS="$(git --no-pager log --all --since="$SINCE" --until="$UNTIL" --reverse --format='%H' 2>/dev/null | awk '!seen[$0]++')"
 
 APPENDED=0
 if [ -n "$COMMITS" ]; then
@@ -91,10 +94,19 @@ if [ -n "$COMMITS" ]; then
 
     [ "$touched_source" -eq 0 ] && continue
 
-    # Build the entry line.
+    # Build the entry line. Tag with branch name if this commit is NOT on
+    # the current branch (so it's clear when work happened in a worktree).
     time_hm="$(git --no-pager show -s --format='%cd' --date=format:'%H:%M' "$sha")"
     subject="$(git --no-pager show -s --format='%s' "$sha")"
-    printf -- '- %s — %s (%s)\n' "$time_hm" "$subject" "$short" >> "$PROGRESS_FILE"
+    cur_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    branch_tag=""
+    if [ -n "$cur_branch" ] && ! git merge-base --is-ancestor "$sha" "$cur_branch" 2>/dev/null; then
+      # Find a non-HEAD branch this commit is on.
+      other_branch="$(git branch --contains "$sha" --format='%(refname:short)' 2>/dev/null \
+        | grep -v "^$cur_branch$" | head -1)"
+      [ -n "$other_branch" ] && branch_tag=" — branch $other_branch"
+    fi
+    printf -- '- %s — %s (%s%s)\n' "$time_hm" "$subject" "$short" "$branch_tag" >> "$PROGRESS_FILE"
     APPENDED=$((APPENDED + 1))
   done <<< "$COMMITS"
 fi
